@@ -1,0 +1,100 @@
+name: Residual PAC Privacy Minimal CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  pac-minimal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      privacy_bound: ${{ steps.metrics.outputs.privacy_bound }}
+      target_bound: ${{ steps.metrics.outputs.target_bound }}
+      bound_gap: ${{ steps.metrics.outputs.bound_gap }}
+      runtime_seconds: ${{ steps.metrics.outputs.runtime_seconds }}
+      peak_memory_kb: ${{ steps.metrics.outputs.peak_memory_kb }}
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone Residual-PAC-Privacy repository
+        run: git clone --depth 1 https://github.com/ztao10086/Residual-PAC-Privacy.git
+
+      - name: Install dependencies from README guidance
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch torchvision nflows scikit-learn
+
+      - name: Run minimal end-to-end PAC pipeline
+        id: run_pac
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          timeout --signal=TERM 20m /usr/bin/time -v \
+            python scripts/ci/run_residual_pac_minimal.py \
+              --repo-dir Residual-PAC-Privacy \
+              --script Iris_s.py \
+              --shard-per-class 5 \
+              --output-dir artifacts \
+            2>&1 | tee artifacts/run.log
+
+          if rg -i "\bnan\b|\binf\b|numerical instability|singular" artifacts/run.log; then
+            echo "Numerical instability detected in run log" >&2
+            exit 16
+          fi
+
+      - name: Collect metrics and publish step outputs
+        id: metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+
+          summary = json.loads(Path('artifacts/summary.json').read_text())
+          log = Path('artifacts/run.log').read_text()
+
+          peak_kb = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', log)
+          wall = re.search(r'Elapsed \(wall clock\) time \(h:mm:ss or m:ss\):\s*([^\n]+)', log)
+
+          def parse_elapsed(s: str) -> float:
+              s = s.strip()
+              parts = s.split(':')
+              nums = [float(p) for p in parts]
+              if len(nums) == 2:
+                  m, sec = nums
+                  return m * 60 + sec
+              if len(nums) == 3:
+                  h, m, sec = nums
+                  return h * 3600 + m * 60 + sec
+              raise ValueError(f'Unexpected elapsed format: {s}')
+
+          runtime = parse_elapsed(wall.group(1)) if wall else -1.0
+          peak = int(peak_kb.group(1)) if peak_kb else -1
+
+          out = Path(os.environ['GITHUB_OUTPUT'])
+          with out.open('a') as f:
+              f.write(f"privacy_bound={summary['privacy_bound']}\n")
+              f.write(f"target_bound={summary['target_bound']}\n")
+              f.write(f"bound_gap={summary['bound_gap']}\n")
+              f.write(f"runtime_seconds={runtime}\n")
+              f.write(f"peak_memory_kb={peak}\n")
+          PY
+
+      - name: Upload PAC CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: residual-pac-minimal-ci
+          path: artifacts/
+          if-no-files-found: error
