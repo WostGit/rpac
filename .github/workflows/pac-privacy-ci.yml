@@ -1,0 +1,64 @@
+name: PAC Privacy Minimal CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: ["main", "master"]
+
+jobs:
+  pac-minimal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    outputs:
+      privacy_bound: ${{ steps.collect.outputs.privacy_bound }}
+      runtime_wall_clock: ${{ steps.collect.outputs.runtime_wall_clock }}
+      peak_memory_kb: ${{ steps.collect.outputs.peak_memory_kb }}
+      script: ${{ steps.collect.outputs.script }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Clone Residual-PAC-Privacy
+        run: |
+          git clone --depth 1 https://github.com/ztao10086/Residual-PAC-Privacy.git
+
+      - name: Run minimal-resource end-to-end PAC pipeline
+        run: |
+          bash scripts/ci_run_pac.sh Residual-PAC-Privacy "$GITHUB_WORKSPACE/pac_ci_out"
+
+      - name: Collect metrics and expose outputs
+        id: collect
+        run: |
+          METRICS="$GITHUB_WORKSPACE/pac_ci_out/pac_metrics.txt"
+          test -s "$METRICS"
+          cat "$METRICS"
+
+          privacy_bound="$(grep '^privacy_bound=' "$METRICS" | sed 's/^privacy_bound=//')"
+          runtime_wall_clock="$(grep '^runtime_wall_clock=' "$METRICS" | sed 's/^runtime_wall_clock=//')"
+          peak_memory_kb="$(grep '^peak_memory_kb=' "$METRICS" | sed 's/^peak_memory_kb=//')"
+          script="$(grep '^script=' "$METRICS" | sed 's/^script=//')"
+
+          {
+            echo "privacy_bound=$privacy_bound"
+            echo "runtime_wall_clock=$runtime_wall_clock"
+            echo "peak_memory_kb=$peak_memory_kb"
+            echo "script=$script"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload PAC CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-minimal-run
+          path: |
+            pac_ci_out/pac_run.log
+            pac_ci_out/time.txt
+            pac_ci_out/pac_metrics.txt
+          if-no-files-found: error
