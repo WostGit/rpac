@@ -1,0 +1,230 @@
+name: PAC Privacy Minimal CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  residual-pac-minimal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      script: ${{ steps.run_pipeline.outputs.script }}
+      privacy_bound: ${{ steps.run_pipeline.outputs.privacy_bound }}
+      runtime_seconds: ${{ steps.run_pipeline.outputs.runtime_seconds }}
+      peak_memory_kb: ${{ steps.run_pipeline.outputs.peak_memory_kb }}
+    steps:
+      - name: Clone Residual-PAC-Privacy
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ztao10086/Residual-PAC-Privacy.git upstream
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies from README
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+
+          if [[ ! -f README.md ]]; then
+            echo "README.md not found; cannot install dependencies as documented." >&2
+            exit 2
+          fi
+
+          # Execute only pip install commands documented in README code blocks.
+          python - <<'PY'
+import re
+import subprocess
+from pathlib import Path
+
+readme = Path("README.md").read_text(encoding="utf-8", errors="ignore")
+commands = []
+for block in re.findall(r"```(?:bash|sh|shell)?\n(.*?)```", readme, flags=re.S | re.I):
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.match(r"^(python\s+-m\s+pip|pip3?|uv\s+pip)\s+install\b", line):
+            commands.append(line)
+
+# Fallback to requirements.txt if README has no explicit pip install command.
+if not commands and Path("requirements.txt").exists():
+    commands = ["python -m pip install -r requirements.txt"]
+
+if not commands:
+    raise SystemExit("No pip install commands found in README and no requirements.txt fallback available.")
+
+seen = set()
+for cmd in commands:
+    if cmd in seen:
+        continue
+    seen.add(cmd)
+    print(f"Running: {cmd}", flush=True)
+    subprocess.run(cmd, shell=True, check=True)
+PY
+
+      - name: Run minimal end-to-end PAC privacy pipeline
+        id: run_pipeline
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SCRIPT=""
+          if [[ -f Iris_s.py ]]; then
+            SCRIPT="Iris_s.py"
+          elif [[ -f MNIST_s.py ]]; then
+            SCRIPT="MNIST_s.py"
+          else
+            echo "Neither Iris_s.py nor MNIST_s.py exists in repo root." >&2
+            exit 3
+          fi
+          echo "script=${SCRIPT}" >> "$GITHUB_OUTPUT"
+
+          HELP_TEXT="$(python "$SCRIPT" --help 2>&1 || true)"
+          declare -a ARGS=()
+
+          add_if_supported() {
+            local key="$1"
+            local val="$2"
+            if grep -Eq "(^|[[:space:]])${key}([=[:space:],]|$)" <<<"$HELP_TEXT"; then
+              ARGS+=("$key" "$val")
+            fi
+          }
+
+          add_if_supported "--epochs" "1"
+          add_if_supported "--n_epochs" "1"
+          add_if_supported "--num_epochs" "1"
+          add_if_supported "--batch-size" "4"
+          add_if_supported "--batch_size" "4"
+          add_if_supported "--bs" "4"
+          add_if_supported "--runs" "1"
+          add_if_supported "--n_runs" "1"
+          add_if_supported "--num_runs" "1"
+          add_if_supported "--repeat" "1"
+          add_if_supported "--repetitions" "1"
+          add_if_supported "--mc-samples" "1"
+          add_if_supported "--mc_samples" "1"
+          add_if_supported "--stochastic-reps" "1"
+          add_if_supported "--subset-size" "64"
+          add_if_supported "--subset_size" "64"
+          add_if_supported "--train-size" "64"
+          add_if_supported "--train_size" "64"
+          add_if_supported "--sample-size" "64"
+          add_if_supported "--sample_size" "64"
+          add_if_supported "--hidden-size" "8"
+          add_if_supported "--hidden_size" "8"
+          add_if_supported "--hidden-dim" "8"
+          add_if_supported "--hidden_dim" "8"
+          add_if_supported "--width" "8"
+          add_if_supported "--depth" "1"
+
+          echo "Running ${SCRIPT} with args: ${ARGS[*]:-<none>}"
+
+          /usr/bin/time -v timeout 25m python "$SCRIPT" "${ARGS[@]}" > run.log 2>&1 || status=$?
+          status=${status:-0}
+
+          if [[ "$status" -eq 124 ]]; then
+            echo "PAC privacy run exceeded CI time limit (timeout 25m)." >&2
+            cat run.log >&2 || true
+            exit 124
+          elif [[ "$status" -ne 0 ]]; then
+            echo "PAC privacy run failed with exit code ${status}." >&2
+            cat run.log >&2 || true
+            exit "$status"
+          fi
+
+          if grep -Eiq '(^|[^a-zA-Z])(nan|inf)([^a-zA-Z]|$)|overflow|underflow|singular|numerical instab' run.log; then
+            echo "Numerical instability detected in run output." >&2
+            cat run.log >&2 || true
+            exit 9
+          fi
+
+          BOUND_LINE="$(grep -Ei 'pac[^a-zA-Z0-9_-]*bound|privacy[^a-zA-Z0-9_-]*bound|bound[^a-zA-Z0-9_-]*(tight|final|residual|leakage)' run.log | tail -n 1 || true)"
+          if [[ -z "$BOUND_LINE" ]]; then
+            echo "PAC-style privacy bound was not found in output." >&2
+            cat run.log >&2 || true
+            exit 10
+          fi
+
+          PRIVACY_BOUND="$(python - <<'PY'
+import re
+from pathlib import Path
+text = Path('run.log').read_text(encoding='utf-8', errors='ignore')
+lines = [ln for ln in text.splitlines() if re.search(r'pac\W*bound|privacy\W*bound|bound\W*(tight|final|residual|leakage)', ln, flags=re.I)]
+if not lines:
+    raise SystemExit('')
+nums = re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', lines[-1])
+print(nums[-1] if nums else lines[-1].strip())
+PY
+)"
+
+          RUNTIME_SECONDS="$(grep -E '^\s*Elapsed \(wall clock\) time' run.log | tail -n1 | sed -E 's/.*: *//' | python - <<'PY'
+import sys
+s=sys.stdin.read().strip()
+if not s:
+    print('')
+    raise SystemExit
+parts=s.split(':')
+if len(parts)==3:
+    h,m,sec=parts
+    print(int(h)*3600+int(m)*60+float(sec))
+elif len(parts)==2:
+    m,sec=parts
+    print(int(m)*60+float(sec))
+else:
+    print(float(parts[0]))
+PY
+)"
+
+          PEAK_MEMORY_KB="$(grep -E '^\s*Maximum resident set size \(kbytes\)' run.log | tail -n1 | awk -F: '{gsub(/^ +| +$/, "", $2); print $2}')"
+
+          if [[ -z "$PRIVACY_BOUND" ]]; then
+            echo "Failed to parse privacy bound value from output." >&2
+            exit 11
+          fi
+          if [[ -z "$RUNTIME_SECONDS" ]]; then
+            echo "Failed to parse runtime from /usr/bin/time output." >&2
+            exit 12
+          fi
+          if [[ -z "$PEAK_MEMORY_KB" ]]; then
+            echo "Failed to parse peak memory from /usr/bin/time output." >&2
+            exit 13
+          fi
+
+          {
+            echo "privacy_bound=${PRIVACY_BOUND}"
+            echo "runtime_seconds=${RUNTIME_SECONDS}"
+            echo "peak_memory_kb=${PEAK_MEMORY_KB}"
+          } >> "$GITHUB_OUTPUT"
+
+          python - <<PY
+import json
+summary = {
+  "script": "${SCRIPT}",
+  "privacy_bound": "${PRIVACY_BOUND}",
+  "runtime_seconds": "${RUNTIME_SECONDS}",
+  "peak_memory_kb": "${PEAK_MEMORY_KB}"
+}
+with open("pac_privacy_metrics.json", "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+PY
+
+      - name: Upload run logs and metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-minimal
+          path: |
+            upstream/run.log
+            upstream/pac_privacy_metrics.json
