@@ -1,0 +1,161 @@
+name: PAC Privacy CI Feasibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  pac-bound-feasibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      privacy_bound: ${{ steps.parse.outputs.privacy_bound }}
+      runtime: ${{ steps.parse.outputs.runtime }}
+      peak_memory_kb: ${{ steps.parse.outputs.peak_memory_kb }}
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Clone Residual-PAC-Privacy
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/ztao10086/Residual-PAC-Privacy residual-pac-privacy
+
+      - name: Install dependencies from README guidance
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch torchvision nflows scikit-learn
+
+      - name: Configure strict minimal-resource mode
+        working-directory: residual-pac-privacy
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib, re
+
+          p = pathlib.Path('Iris_s.py')
+          s = p.read_text()
+
+          replacements = {
+              r"BETAS\s*=\s*\[[^\]]+\]": "BETAS = [1/128]",
+              r"POOL_SIZE\s*=\s*\d+": "POOL_SIZE = 8",
+              r"SR_OUTER\s*=\s*\d+": "SR_OUTER = 2",
+              r"SR_INNER\s*=\s*\d+": "SR_INNER = 5",
+              r"CAL_BATCH\s*=\s*\d+": "CAL_BATCH = 16",
+              r"REPORT_BATCH\s*=\s*\d+": "REPORT_BATCH = 16",
+              r"def __init__\(self, d, hid=\d+, n_heads=\d+, n_layers=\d+\)": "def __init__(self, d, hid=32, n_heads=1, n_layers=1)",
+              r"def train_base_decoder\(X_train, X_val, d, epochs=\d+, batch_size=\d+, patience=\d+, steps_per_epoch=\d+, val_batches=\d+\)": "def train_base_decoder(X_train, X_val, d, epochs=3, batch_size=16, patience=2, steps_per_epoch=20, val_batches=5)",
+              r"def train_noise_aware_decoder\(base_decoder, X, Sigma, \*, steps=\d+, batch_size=\d+, lr=1e-4, weight_decay=1e-4, seed=123\)": "def train_noise_aware_decoder(base_decoder, X, Sigma, *, steps=40, batch_size=16, lr=1e-4, weight_decay=1e-4, seed=123)",
+              r"\*, steps=\d+, batch_size=\d+, lr=1e-4, weight_decay=1e-4, seed=135": "*, steps=40, batch_size=16, lr=1e-4, weight_decay=1e-4, seed=135",
+              r"n_points=120, n_in=80, n_out=80": "n_points=20, n_in=10, n_out=10",
+              r"trials=200": "trials=20",
+          }
+
+          for pat, rep in replacements.items():
+              s2, n = re.subn(pat, rep, s)
+              if n > 0:
+                  s = s2
+
+          p.write_text(s)
+          PY
+
+          python - <<'PY'
+          from sklearn.datasets import load_iris
+          X, y = load_iris(return_X_y=True)
+          labels = ['Iris-setosa', 'Iris-versicolor', 'Iris-virginica']
+          with open('iris.data', 'w', encoding='utf-8') as f:
+              for row, yi in zip(X, y):
+                  f.write(','.join(f'{v:.1f}' for v in row) + ',' + labels[int(yi)] + '\n')
+          PY
+
+      - name: Run full PAC-style bound pipeline under CI budget
+        id: run
+        working-directory: residual-pac-privacy
+        run: |
+          set -euo pipefail
+          set +e
+          timeout 20m /usr/bin/time -v python Iris_s.py 2>&1 | tee run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [ "$status" -eq 124 ]; then
+            echo "::error::PAC-style pipeline exceeded 20 minute CI time limit."
+            exit 124
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::PAC-style pipeline failed with exit code $status."
+            exit "$status"
+          fi
+
+      - name: Validate outputs and export metrics
+        id: parse
+        working-directory: residual-pac-privacy
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, pathlib, re, sys
+
+          log_path = pathlib.Path('run.log')
+          if not log_path.exists():
+              print('run.log missing; PAC bound run did not complete.', file=sys.stderr)
+              sys.exit(10)
+
+          txt = log_path.read_text(errors='replace')
+
+          if re.search(r'\b(nan|inf)\b', txt, flags=re.IGNORECASE):
+              print('Numerical instability detected (nan/inf in logs).', file=sys.stderr)
+              sys.exit(11)
+
+          bound_matches = re.findall(r'achieved H_c=([0-9eE+\-.]+)', txt)
+          if not bound_matches:
+              print('No PAC-style bound (achieved H_c) found in logs.', file=sys.stderr)
+              sys.exit(12)
+
+          bound = float(bound_matches[-1])
+          if not math.isfinite(bound):
+              print('PAC-style bound is non-finite.', file=sys.stderr)
+              sys.exit(13)
+
+          runtime_match = re.search(r'Elapsed \(wall clock\) time .*: ([0-9:.]+)', txt)
+          if runtime_match:
+              runtime = runtime_match.group(1)
+          else:
+              runtime = 'unknown'
+
+          mem_match = re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', txt)
+          if not mem_match:
+              print('Peak memory metric missing from /usr/bin/time output.', file=sys.stderr)
+              sys.exit(14)
+          peak_kb = int(mem_match.group(1))
+
+          summary = {
+              'privacy_bound_achieved_h_c': bound,
+              'runtime_wall_clock': runtime,
+              'peak_memory_kb': peak_kb,
+          }
+
+          pathlib.Path('pac_ci_summary.json').write_text(json.dumps(summary, indent=2))
+
+          out = pathlib.Path(__import__('os').environ['GITHUB_OUTPUT'])
+          out.write_text(
+              f"privacy_bound={bound}\n"
+              f"runtime={runtime}\n"
+              f"peak_memory_kb={peak_kb}\n",
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Upload PAC CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pac-privacy-ci-artifacts
+          path: |
+            residual-pac-privacy/run.log
+            residual-pac-privacy/pac_ci_summary.json
